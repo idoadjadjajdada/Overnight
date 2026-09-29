@@ -337,6 +337,15 @@ button.bub{font:inherit;text-align:left;border:0;cursor:pointer}
 .react{align-self:flex-start;margin:-6px 0 4px 10px;background:var(--bg);border:1px solid var(--line);border-radius:999px;padding:1px 6px;font-size:12px;display:flex;align-items:center;gap:2px;color:var(--pink)}
 .react.me{align-self:flex-end;margin:-6px 10px 4px 0}
 .react .hr{width:13px;height:13px;fill:var(--pink);stroke:var(--pink)}
+
+.cropwrap{display:flex;justify-content:center;padding:12px 16px 4px}
+#cropCv{width:280px;height:280px;border-radius:12px;background:#000;touch-action:none;cursor:grab}
+#cropCv:active{cursor:grabbing}
+.cropzoom{display:flex;align-items:center;gap:12px;padding:8px 24px;color:var(--dim)}
+.cropzoom input{flex:1;accent-color:var(--blue)}
+.dbg{margin:0 16px 16px;border:1px solid var(--line);border-radius:10px;padding:8px 12px;font-size:13px;color:var(--dim)}
+.dbg summary{cursor:pointer;font-weight:700;color:var(--fg)}
+.dbg pre{white-space:pre-wrap;word-break:break-word;max-height:220px;overflow:auto;background:var(--chip);padding:8px;border-radius:6px;font-size:12px}
 #toast{display:none;align-items:center;gap:16px}
 #toast button{color:#fff;font-weight:700;text-decoration:underline}
 </style>
@@ -455,6 +464,7 @@ const S = {
 };
 const U = {}, genBusy = {}, genErr = {};
 const working = new Set();
+const AIDBG = {raw: '', err: '', when: 0, engine: '', kind: '', parsed: 0};
 let pendingSend = null;
 let route = {tab: 'home', view: null}, stack = [], sheet = null, menu = null, drawer = false, busy = false, feedBusy = false, dmBusy = {}, sample = null, sampleChecked = false,
     notifFilter = 'all', homeSeg = 'for', replyTo = null, query = '', newPill = null;
@@ -876,19 +886,39 @@ ${lean() ? '4 to 5' : '6 to 8'} posts, newest first, what this exact person woul
 }
 
 /* ================= engine ================= */
+const numish = v => { if (typeof v === 'number') return v; const m = /^\s*([\d.]+)\s*([kKmM])?/.exec(String(v || '')); return m ? Math.round(+m[1] * (m[2] ? (/[mM]/.test(m[2]) ? 1e6 : 1e3) : 1)) : 0; };
 function norm(o){
-  const T = {s: 'stats', r: 'reply', m: 'mem', cn: 'note', p: 'post', tr: 'trend'}, x = {...o};
-  if (T[o.t]) x.t = T[o.t];
+  const T = {s: 'stats', r: 'reply', m: 'mem', cn: 'note', p: 'post', tr: 'trend', stat: 'stats', replies: 'reply', message: 'msg', memory: 'mem'}, x = {...o};
+  if (!o.t && o.type) o = {...o, t: o.type};
+  // infer the kind when the model forgot "t"
+  if (!o.t){
+    if ('vir' in o || 'virality' in o) o = {...o, t: 's'};
+    else if (('x' in o || 'text' in o) && ('to' in o || 'w' in o || 'who' in o)) o = {...o, t: 'r'};
+    else if ('id' in o && ('f' in o || 'feeling' in o)) o = {...o, t: 'm'};
+    else if ('x' in o || 'text' in o || 'message' in o) o = {...o, t: 'msg', x: o.x ?? o.text ?? o.message};
+  }
+  x.t = T[o.t] || o.t;
   const map = {w: 'who', h: 'handle', x: 'text', l: 'likes', f: 'feeling', nt: 'note', op: 'opinion', vir: 'virality', y: 'why', rp: 'reposts', rc: 'replies'};
   for (const k in map) if (k in o) x[map[k]] = o[k];
   if ('n' in o && x.t !== 'note') x.name = o.n;
-  x.v = o.v === 1 || o.v === true;
+  x.v = o.v === 1 || o.v === true || o.v === '1' || o.verified === true;
+  if ('likes' in x) x.likes = numish(x.likes);
+  if (typeof x.to === 'string' && /^-?\d+$/.test(x.to.trim())) x.to = parseInt(x.to, 10);
+  if (x.text != null) x.text = String(x.text).trim();
   return x;
 }
 function lineReader(onObj){
   // Extracts each complete top-level JSON object as it streams in. Works for one-per-line,
   // pretty-printed, wrapped in an array, or inside code fences.
   let buf = '', depth = 0, inStr = false, esc = false, start = -1, pos = 0;
+  const raw = {bad: 0, n: 0};
+  const feed = o => {
+    if (!o || typeof o !== 'object') return;
+    if (Array.isArray(o)){ o.forEach(feed); return; }
+    const arrays = Object.values(o).filter(v => Array.isArray(v) && v.some(x => x && typeof x === 'object'));
+    if (!o.t && !o.type && arrays.length && !('x' in o || 'text' in o)){ arrays.forEach(a => a.forEach(feed)); Object.keys(o).forEach(k => { if (!Array.isArray(o[k]) && o[k] && typeof o[k] === 'object') feed(o[k]); }); return; }
+    raw.n++; onObj(norm(o));
+  };
   const scan = () => {
     for (; pos < buf.length; pos++){
       const ch = buf[pos];
@@ -899,13 +929,13 @@ function lineReader(onObj){
         depth--;
         if (depth === 0 && start >= 0){
           const chunk = buf.slice(start, pos + 1); start = -1;
-          try{ const o = JSON.parse(chunk); if (o && typeof o === 'object' && !Array.isArray(o)) onObj(norm(o)); }catch(e){}
+          try{ feed(JSON.parse(chunk)); }catch(e){ raw.bad++; }
         }
       }
     }
     if (depth === 0 && pos > 4096){ buf = buf.slice(pos); pos = 0; }
   };
-  return { onText: ({delta}) => { buf += delta || ''; scan(); }, flush: () => { scan(); } };
+  return { onText: ({delta}) => { buf += delta || ''; AIDBG.raw = (AIDBG.raw + (delta || '')).slice(-4000); scan(); }, flush: () => { scan(); }, stats: raw };
 }
 function makeAcct(o){
   const c = castById(String(o.who || ''));
@@ -959,14 +989,14 @@ async function gemBody(input, opts, json){
   const gc = {temperature: 1, maxOutputTokens: json ? 1400 : 2400};
   if (json) gc.responseMimeType = 'application/json';
   if (GEM.noThink) gc.thinkingConfig = {thinkingBudget: 0};
-  return {contents: [{role: 'user', parts}], generationConfig: gc};
+  return {contents: [{role: 'user', parts}], generationConfig: gc, safetySettings: ['HARM_CATEGORY_HARASSMENT', 'HARM_CATEGORY_HATE_SPEECH'].map(category => ({category, threshold: 'BLOCK_ONLY_HIGH'}))};
 }
 async function gemFetch(method, body){
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEM.model())}:${method}&key=${encodeURIComponent(GEM.key())}`;
   const go = () => fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body), signal: body.__signal});
   let r = await go();
   if (r.status === 400 && GEM.noThink){ const t = await r.clone().text(); if (/think/i.test(t)){ GEM.noThink = false; delete body.generationConfig.thinkingConfig; r = await go(); } }
-  if (!r.ok){ let b = null; try{ b = await r.json(); }catch(e){} throw gemErr(r.status, b); }
+  if (!r.ok){ let b = null; try{ b = await r.json(); }catch(e){} AIDBG.err = 'HTTP ' + r.status + ' ' + ((b && b.error && b.error.message) || ''); throw gemErr(r.status, b); }
   return r;
 }
 const gemSample = async (input, opts = {}) => {
@@ -977,6 +1007,7 @@ const gemSample = async (input, opts = {}) => {
   for (;;){ const {value, done} = await reader.read(); if (done) break; buf += dec.decode(value, {stream: true}); let i; while ((i = buf.indexOf('\n')) >= 0){ eat(buf.slice(0, i)); buf = buf.slice(i + 1); } }
   eat(buf);
   if (!text && blocked) throw Object.assign(new Error('blocked'), {code: 'refused'});
+  if (!text) throw Object.assign(new Error('Gemini sent back nothing'), {code: 'unavailable'});
   return {text, truncated: false, modelTierApplied: 'quick'};
 };
 gemSample.json = async (input, opts = {}) => {
@@ -1027,7 +1058,8 @@ function streamReplies(p, prompt, opts){
   return new Promise(async resolve => {
     const sm = await ensureSample(); if (!sm){ toast(NEED); resolve(false); return; }
     const queue = [], made = []; let memChanged = false, done = false;
-    const reader = lineReader(o => {
+    Object.assign(AIDBG, {raw: '', err: '', when: Date.now(), engine: engine() === 'gemini' ? 'Gemini · ' + GEM.model() : 'Claude', kind: opts.kind || 'replies', parsed: 0});
+    const reader = lineReader(o => { AIDBG.parsed++;
       if (o.t === 'reply' && o.text){ const r = makeReply(o); r.to = opts.mapTo(o, made); made.push(r); queue.push(r); }
       else if (o.t === 'mem') memChanged = applyMem(o) || memChanged;
       else if (opts.onExtra) opts.onExtra(o);
@@ -1037,7 +1069,8 @@ function streamReplies(p, prompt, opts){
       else if (done){ clearInterval(drip); if (memChanged) saveCast(); flushMoods(); resolve(made.length); }
     }, opts.gap || 900);
     try{ await sm(prompt, {modelTier: tier(), cache: false, onText: reader.onText, ...(opts.images ? {images: opts.images} : {})}); reader.flush(); }
-    catch(e){ reader.flush(); const m = e && (e.code === 'image_rejected' || e.code === 'images_unavailable') ? "Claude couldn't look at that photo." : errCopy(e); if (m) toast(m); }
+    catch(e){ reader.flush(); AIDBG.err = (e && (e.code || '') + ' ' + (e.message || '')).trim(); const m = e && (e.code === 'image_rejected' || e.code === 'images_unavailable') ? "The AI couldn't look at that photo." : errCopy(e); if (m) toast(m); }
+    if (!made.length && !AIDBG.err && AIDBG.raw.trim()) AIDBG.err = 'Answered, but in a shape the app could not read';
     done = true;
   });
 }
@@ -1057,7 +1090,7 @@ async function doPost(text, quote, extra = {}){
   const made = await streamReplies(post, postPrompt(post), {
     gap: 650,
     images: post.image && imgCaps ? dataToBlob(post.image) : null,
-    mapTo: (o, m) => { const ti = Number.isInteger(o.to) ? o.to : -1; return ti >= 0 && m[ti] ? m[ti].id : -1; },
+    mapTo: (o, m) => { const ti = Number.isInteger(o.to) ? o.to : (/^\d+$/.test(String(o.to)) ? +o.to : -1); return ti >= 0 && m[ti] ? m[ti].id : -1; },
     onExtra: o => {
       if (o.t === 'stats' && post.virality === null) setStats(post, o);
       else if (o.t === 'note' && o.text) post.note = String(o.text).slice(0, 240);
@@ -1170,7 +1203,7 @@ async function doReply(p, targetId, text){
   p.replies.push(mine); replyTo = null; render();
   const n = await streamReplies(p, replyPrompt(p, target, mine), {gap: 1000, mapTo: (o, made) => { const to = String(o.to ?? 'me').replace(/[\[\]]/g, ''); return p.replies.some(x => x.id === to) || made.some(x => x.id === to) ? to : mine.id; }});
   working.delete(p.id); savePost(p); checkAch(); if (showing(p)) render();
-  if (n === 0) toast('Nobody answered that one yet.', {label: 'Try again', fn: () => retryReply(p, mine)});
+  if (n === 0 && !AIDBG.err.startsWith('rate') ) toast(AIDBG.err && /shape/.test(AIDBG.err) ? 'The AI answered in a format the app could not read.' : 'Nobody answered that one yet.', {label: 'Try again', fn: () => retryReply(p, mine)});
 }
 async function retryReply(p, mine){
   if (working.has(p.id)) return; working.add(p.id); render();
@@ -1189,7 +1222,7 @@ async function doExtend(p, focusId){
 }
 async function loadOthersReplies(p){
   if (p.loading || working.has(p.id)) return; p.loading = true; working.add(p.id); render();
-  await streamReplies(p, othersRepliesPrompt(p), {gap: 600, mapTo: (o, m) => { const ti = Number.isInteger(o.to) ? o.to : -1; return ti >= 0 && m[ti] ? m[ti].id : -1; }});
+  await streamReplies(p, othersRepliesPrompt(p), {gap: 600, mapTo: (o, m) => { const ti = Number.isInteger(o.to) ? o.to : (/^\d+$/.test(String(o.to)) ? +o.to : -1); return ti >= 0 && m[ti] ? m[ti].id : -1; }});
   p.loading = false; p.loaded = true; working.delete(p.id); savePost(p); if (showing(p)) render();
 }
 async function loadTimeline(topic, quiet){
@@ -1235,7 +1268,8 @@ async function sendDm(key, text){
   const sm = await ensureSample(); if (!sm){ toast(NEED); render(); return; }
   dmBusy[key] = true; render(); scrollChat();
   const out = []; let memChanged = false, seen = false, block = false;
-  const reader = lineReader(o => {
+  Object.assign(AIDBG, {raw: '', err: '', when: Date.now(), engine: engine() === 'gemini' ? 'Gemini · ' + GEM.model() : 'Claude', kind: 'DM', parsed: 0});
+  const reader = lineReader(o => { AIDBG.parsed++;
     if (o.t === 'msg' && o.text) out.push(String(o.text).slice(0, 500));
     else if (o.t === 'mem') memChanged = applyMem(o, key) || memChanged;
     else if (o.t === 'seen' && !acct(key).news) seen = true;
@@ -1243,7 +1277,8 @@ async function sendDm(key, text){
     else if (o.t === 'react'){ const lm = [...conv.msgs].reverse().find(x => x.from === 'me'); if (lm) lm.theirHeart = true; }
   });
   try{ await sm(dmPrompt(key), {modelTier: tier(), cache: false, onText: reader.onText}); reader.flush(); }
-  catch(e){ reader.flush(); const m = errCopy(e); if (m) toast(m); }
+  catch(e){ reader.flush(); AIDBG.err = (e && (e.code || '') + ' ' + (e.message || '')).trim(); const m = errCopy(e); if (m) toast(m); }
+  if (!out.length && !seen && !AIDBG.err && AIDBG.raw.trim()){ AIDBG.err = 'Answered, but in a shape the app could not read'; const plain = AIDBG.raw.replace(/```[a-z]*|```/g, '').trim(); if (plain && !/[{}]/.test(plain)) out.push(plain.slice(0, 500)); }
   if (!out.length && seen){ await new Promise(r => setTimeout(r, 900)); conv.seen = true; }
   else if (!out.length && !block){ dmBusy[key] = false; render(); toast('No reply came through.', {label: 'Try again', fn: () => redoDm(key)}); return; }
   for (const t of out){ await new Promise(r => setTimeout(r, 600 + Math.min(2200, t.length * 30))); conv.msgs.push({from: 'them', text: t, time: Date.now()}); if (!inChat(key)) conv.unread = (conv.unread || 0) + 1; if (inChat(key)){ render(); scrollChat(); } }
@@ -1613,6 +1648,12 @@ function renderSheet(){
       <div class="chint" id="chint"></div>
       ${sheet.editId ? '' : `<button class="scope" data-scope>${ic('globe')}${scopeTxt}</button>`}
       <div class="cfoot"><div class="tools">${sheet.editId ? '' : `<button class="iconbtn tool" data-addphoto ${pl ? 'disabled' : ''} aria-label="Add photo">${ic('photo')}</button><button class="iconbtn tool" data-addpoll ${sheet.image || sheet.quote ? 'disabled' : ''} aria-label="Add poll">${ic('poll')}</button><button class="iconbtn tool" data-addpart ${(sheet.parts || []).length >= 4 ? 'disabled' : ''} aria-label="Add another post to make a thread">${ic('plus')}</button>`}</div><div style="flex:1"></div><svg class="ring" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10" fill="none" stroke="var(--line)" stroke-width="2"/><circle id="ringFill" cx="12" cy="12" r="10" fill="none" stroke="var(--blue)" stroke-width="2" stroke-dasharray="62.8" stroke-dashoffset="62.8" transform="rotate(-90 12 12)"/></svg><span class="dim" id="left"></span></div>`;
+  } else if (sheet.type === 'crop'){
+    inner = `<div class="hd"><button class="iconbtn" data-cropcancel aria-label="Cancel">${ic('back')}</button><h3>Edit photo</h3><button class="pill dark sm" data-cropsave>Apply</button></div>
+      <div class="cropwrap"><canvas id="cropCv" width="280" height="280" aria-label="Drag to position the photo, pinch or use the slider to zoom"></canvas></div>
+      <div class="cropzoom">${ic('search')}<input id="cropZoom" type="range" min="1" max="5" step="0.01" value="${sheet.zoom}" aria-label="Zoom"><button class="link2" data-cropreset>Reset</button></div>
+      <p class="hint" style="text-align:center;margin:8px 16px 16px">Drag to move. Pinch or slide to zoom.</p>
+      ${(sheet.target === 'me' ? S.profile.photo : S.photos[sheet.target]) ? `<div class="stack" style="align-items:center"><button class="pill danger sm" data-cropremove>Remove current photo</button></div>` : ''}`;
   } else if (sheet.type === 'data'){
     inner = `<div class="hd"><button class="iconbtn" data-close aria-label="Close">${ic('back')}</button><h3>${sheet.text ? 'Your data' : 'Import data'}</h3>${sheet.text ? '' : '<button class="pill dark sm" data-doimport>Import</button>'}</div>
       <p class="hint" style="margin-top:0">${sheet.text ? 'Select all of this and copy it, then paste it into Import on the other version.' : 'Paste data copied from the other version. This replaces everything here.'}</p>
@@ -1637,6 +1678,7 @@ function renderSheet(){
       <div class="field"><label for="p-gemkey">Gemini API key ${GEM.key() ? '(saved on this device)' : ''}</label><input id="p-gemkey" type="password" autocomplete="off" placeholder="${GEM.key() ? '•••••••• saved. Paste a new one to replace it' : 'Paste your key from aistudio.google.com'}"></div>
       <p class="hint" style="margin-top:-8px">Stored only in this browser, never in your save data. ${inClaude() ? 'Gemini only works when overnight is hosted outside claude.ai, since claude.ai blocks outside connections.' : ''} Model: <b id="gemModel">${esc(GEM.model())}</b></p>
       <div class="stack" style="padding-bottom:16px;flex-direction:row;flex-wrap:wrap"><button class="pill out sm" data-gemtest>Test key</button>${GEM.key() ? '<button class="pill danger sm" data-gemclear>Remove key</button>' : ''}</div>
+      <details class="dbg"><summary>Last AI call ${AIDBG.when ? '(' + ago(AIDBG.when) + ' ago)' : ''}</summary>${AIDBG.when ? `<p><b>${esc(AIDBG.engine)}</b>, ${esc(AIDBG.kind)}. Readable lines: ${AIDBG.parsed}.${AIDBG.err ? ` Problem: ${esc(AIDBG.err)}` : ' No errors.'}</p><pre>${esc(AIDBG.raw.slice(0, 1500) || '(no text came back)')}</pre>` : '<p>Nothing yet this session.</p>'}</details>
       <div class="field"><label for="p-vol">Usage</label><select id="p-vol"><option value="lean" ${p.volume !== 'full' ? 'selected' : ''}>Lean: fewer replies, smaller prompts (default)</option><option value="full" ${p.volume === 'full' ? 'selected' : ''}>Full: bigger threads, uses more</option></select></div>
       <div class="field"><label for="p-tier">Reply engine</label><select id="p-tier"><option value="quick" ${p.tier !== 'default' ? 'selected' : ''}>Fast (lighter on usage)</option><option value="default" ${p.tier === 'default' ? 'selected' : ''}>Sharper writing (slower, uses more)</option></select></div>
       <div class="stack"><button class="pill danger sm" data-wipe="feed">Delete all my posts and reset followers</button><button class="pill danger sm" data-wipe="timeline">Clear everyone else's posts and trends</button><button class="pill danger sm" data-wipe="dms">Delete all messages</button><button class="pill danger sm" data-wipe="cast">Reset cast, outlets and companies to the originals</button>
@@ -1665,6 +1707,7 @@ function renderSheet(){
       <div id="pickList">${list.map(a => `<button class="pick" data-pickdm="${esc(a.key)}">${img(avatarFor(a), 'av', '')}<div style="min-width:0"><div class="nm"><b>${esc(a.name)}</b>${vf(a.verified)}</div><div class="dim">@${esc(a.handle)}</div></div></button>`).join('') || '<p class="note">Nobody by that name yet.</p>'}</div>`;
   }
   el.innerHTML = `<div class="sheetwrap" data-close-bg><div class="sheet" role="dialog" aria-modal="true">${inner}</div></div>`;
+  if (sheet.type === 'crop'){ syncScrollLock(); requestAnimationFrame(cropDraw); return; }
   const f = el.querySelector('#composeText, #pickQ, input'); if (f){ f.focus(); if (f.id === 'composeText'){ f.setSelectionRange(f.value.length, f.value.length); ringUpdate(); } }
   syncScrollLock();
 }
@@ -1742,15 +1785,63 @@ $('#picker').addEventListener('change', () => {
   const f = $('#picker').files && $('#picker').files[0]; if (!f || !photoFor) return;
   const url = URL.createObjectURL(f), im = new Image();
   im.onload = () => {
-    const s = 200, cv = document.createElement('canvas'); cv.width = cv.height = s; const g = cv.getContext('2d');
-    const m = Math.min(im.width, im.height); g.drawImage(im, (im.width - m) / 2, (im.height - m) / 2, m, m, 0, 0, s, s);
-    const data = cv.toDataURL('image/jpeg', .82); URL.revokeObjectURL(url);
-    if (photoFor === 'me'){ S.profile.photo = data; saveProfile(); } else { S.photos[photoFor] = data; Store.put('av_' + photoFor, {src: data}); }
-    render(); if (sheet) renderSheet(); toast('Photo updated');
+    // keep a manageable working copy, then let the person frame it
+    const k = Math.min(1, 1400 / Math.max(im.width, im.height)), cv = document.createElement('canvas');
+    cv.width = Math.round(im.width * k); cv.height = Math.round(im.height * k); cv.getContext('2d').drawImage(im, 0, 0, cv.width, cv.height);
+    URL.revokeObjectURL(url);
+    const sq = photoFor !== 'me' && !!newsById(photoFor);
+    sheet = {type: 'crop', src: cv.toDataURL('image/jpeg', .9), w: cv.width, h: cv.height, target: photoFor, sq, zoom: 1, x: 0, y: 0, prev: sheet};
+    renderSheet();
   };
   im.onerror = () => toast("That file didn't load as an image.");
   im.src = url;
 });
+const CROP = 280;
+function cropBase(c){ return CROP / Math.min(c.w, c.h); }            // scale where the short side fills the frame
+function cropClamp(c){
+  const s = cropBase(c) * c.zoom, w = c.w * s, h = c.h * s, mx = Math.max(0, (w - CROP) / 2), my = Math.max(0, (h - CROP) / 2);
+  c.x = Math.max(-mx, Math.min(mx, c.x)); c.y = Math.max(-my, Math.min(my, c.y));
+}
+function cropDraw(){
+  const c = sheet, cv = $('#cropCv'); if (!c || c.type !== 'crop' || !cv) return;
+  const g = cv.getContext('2d'), dpr = Math.min(2, devicePixelRatio || 1);
+  if (cv.width !== CROP * dpr){ cv.width = cv.height = CROP * dpr; }
+  g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, CROP, CROP);
+  cropClamp(c); const s = cropBase(c) * c.zoom;
+  if (!c.img){ c.img = new Image(); c.img.onload = cropDraw; c.img.src = c.src; return; }
+  if (!c.img.complete) return;
+  g.drawImage(c.img, CROP / 2 - c.w * s / 2 + c.x, CROP / 2 - c.h * s / 2 + c.y, c.w * s, c.h * s);
+  g.fillStyle = 'rgba(0,0,0,.55)'; g.beginPath(); g.rect(0, 0, CROP, CROP);
+  if (c.sq){ const r = 18; g.moveTo(r, 0); g.arcTo(CROP, 0, CROP, CROP, r); g.arcTo(CROP, CROP, 0, CROP, r); g.arcTo(0, CROP, 0, 0, r); g.arcTo(0, 0, CROP, 0, r); }
+  else g.arc(CROP / 2, CROP / 2, CROP / 2 - 1, 0, Math.PI * 2, true);
+  g.fill('evenodd');
+}
+function cropSave(){
+  const c = sheet, out = 320, cv = document.createElement('canvas'); cv.width = cv.height = out;
+  const g = cv.getContext('2d'), k = out / CROP, s = cropBase(c) * c.zoom * k;
+  g.fillStyle = '#fff'; g.fillRect(0, 0, out, out);
+  g.drawImage(c.img, out / 2 - c.w * s / 2 + c.x * k, out / 2 - c.h * s / 2 + c.y * k, c.w * s, c.h * s);
+  const data = cv.toDataURL('image/jpeg', .86);
+  if (c.target === 'me'){ S.profile.photo = data; saveProfile(); } else { S.photos[c.target] = data; Store.put('av_' + c.target, {src: data}); if (newsById(c.target)) sqSrc.add(data); }
+  sheet = c.prev || null; renderSheet(); render(); toast('Photo updated');
+}
+// drag and pinch on the crop frame
+const cropPtr = new Map(); let cropStart = null;
+document.addEventListener('pointerdown', e => {
+  if (e.target.id !== 'cropCv') return; e.preventDefault(); e.target.setPointerCapture?.(e.pointerId);
+  cropPtr.set(e.pointerId, {x: e.clientX, y: e.clientY}); const c = sheet, pts = [...cropPtr.values()];
+  cropStart = {x: c.x, y: c.y, zoom: c.zoom, pts: pts.map(p => ({...p})), dist: pts.length > 1 ? Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y) : 0};
+});
+document.addEventListener('pointermove', e => {
+  if (!cropPtr.has(e.pointerId) || !sheet || sheet.type !== 'crop') return;
+  cropPtr.set(e.pointerId, {x: e.clientX, y: e.clientY}); const c = sheet, pts = [...cropPtr.values()];
+  if (pts.length > 1 && cropStart.dist){ const d = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y); c.zoom = Math.max(1, Math.min(5, cropStart.zoom * d / cropStart.dist)); const z = $('#cropZoom'); if (z) z.value = c.zoom; }
+  else if (cropStart.pts[0]){ c.x = cropStart.x + (pts[0].x - cropStart.pts[0].x); c.y = cropStart.y + (pts[0].y - cropStart.pts[0].y); }
+  cropDraw();
+});
+const cropEnd = e => { if (!cropPtr.has(e.pointerId)) return; cropPtr.delete(e.pointerId); const c = sheet; if (c && c.type === 'crop'){ const pts = [...cropPtr.values()]; cropStart = {x: c.x, y: c.y, zoom: c.zoom, pts: pts.map(p => ({...p})), dist: 0}; } };
+document.addEventListener('pointerup', cropEnd); document.addEventListener('pointercancel', cropEnd);
+document.addEventListener('wheel', e => { if (e.target.id !== 'cropCv') return; e.preventDefault(); sheet.zoom = Math.max(1, Math.min(5, sheet.zoom * (e.deltaY < 0 ? 1.08 : 1 / 1.08))); const z = $('#cropZoom'); if (z) z.value = sheet.zoom; cropDraw(); }, {passive: false});
 
 /* ================= post photos ================= */
 document.body.insertAdjacentHTML('beforeend', '<input type="file" id="postPicker" accept="image/jpeg,image/png,image/webp,image/gif" hidden>');
@@ -1869,6 +1960,7 @@ $('#menu').addEventListener('click', e => {
   if (act === 'quote'){ const a = authorOf(p); sheet = {type: 'compose', quote: {who: a.who, name: a.name, handle: a.handle, verified: a.verified, text: p.text, postId: p.id}}; renderSheet(); }
 });
 $('#sheet').addEventListener('input', e => {
+  if (e.target.id === 'cropZoom' && sheet && sheet.type === 'crop'){ sheet.zoom = +e.target.value; cropDraw(); return; }
   if (e.target.id === 'composeText'){ sheet.draft = e.target.value; ringUpdate(); }
   if (e.target.dataset.part != null){ sheet.parts[+e.target.dataset.part] = e.target.value; return; }
   if (e.target.dataset.pollopt != null && sheet.poll){ sheet.poll.options[+e.target.dataset.pollopt] = e.target.value; ringUpdate(); }
@@ -1894,6 +1986,7 @@ $('#sheet').addEventListener('change', e => {
   if (e.target.id === 'c-preset' && e.target.value){ const list = sheet.type === 'char' ? PRESETS : BRAND_PRESETS, pr = list.find(p => p[0] === e.target.value); if (pr){ $('#c-persona').value = pr[2]; } } if (e.target.id === 'pollDur' && sheet.poll) sheet.poll.hours = +e.target.value; });
 $('#sheet').addEventListener('click', async e => {
   const wantsDraft = () => sheet && sheet.type === 'compose' && !sheet.editId && ((sheet.draft || '').trim() || sheet.poll);
+  if (e.target.hasAttribute('data-close-bg') && sheet && sheet.type === 'crop'){ sheet = sheet.prev || null; renderSheet(); return; }
   if (e.target.hasAttribute('data-close-bg')){ if (wantsDraft()){ menu = {type: 'draft'}; renderMenu(); return; } sheet = null; renderSheet(); return; }
   const t = e.target.closest('button, [data-usedraft]'); if (!t) return;
   if (t.hasAttribute('data-close')){ if (wantsDraft()){ menu = {type: 'draft'}; renderMenu(); return; } sheet = null; renderSheet(); return; }
@@ -1924,6 +2017,10 @@ $('#sheet').addEventListener('click', async e => {
     return; }
   if (t.dataset.pickdm){ const k = t.dataset.pickdm; sheet = null; renderSheet(); openChat(k); return; }
   if (t.dataset.photo){ pickPhoto(t.dataset.photo); return; }
+  if ('cropsave' in t.dataset){ if (sheet.img && sheet.img.complete) cropSave(); return; }
+  if ('cropcancel' in t.dataset){ sheet = sheet.prev || null; renderSheet(); return; }
+  if ('cropreset' in t.dataset){ Object.assign(sheet, {zoom: 1, x: 0, y: 0}); $('#cropZoom').value = 1; cropDraw(); return; }
+  if ('cropremove' in t.dataset){ const tg = sheet.target; if (tg === 'me'){ S.profile.photo = ''; saveProfile(); } else { delete S.photos[tg]; Store.del('av_' + tg); } sheet = sheet.prev || null; renderSheet(); render(); toast('Photo removed'); return; }
   if ('gemtest' in t.dataset){
     const k = ($('#p-gemkey').value || '').trim() || GEM.key(); if (!k){ toast('Paste a key first.'); $('#p-gemkey').focus(); return; }
     t.disabled = true; t.textContent = 'Testing';
